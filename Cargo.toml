@@ -2,6 +2,9 @@
 name = "omniget-plugin-telegram"
 version = "0.1.0"
 edition = "2021"
+[lib]
+crate-type = ["cdylib"]
+
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -25,4 +28,4 @@ url = "2"
 filetime = "0.2.27"
 os_info = "3"
 sys-locale = "0.3"
-omniget-core = { path = "../omniget-core", features = ["desktop"] }
+omniget-core = { git = "https://github.com/tonhowtf/omniget", path = "src-tauri/omniget-core", features = ["desktop"] }
