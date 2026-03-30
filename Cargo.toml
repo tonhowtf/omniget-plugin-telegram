@@ -28,4 +28,4 @@ url = "2"
 filetime = "0.2.27"
 os_info = "3"
 sys-locale = "0.3"
-omniget-core = { git = "https://github.com/tonhowtf/omniget", path = "src-tauri/omniget-core", features = ["desktop"] }
+omniget-core = { git = "https://github.com/tonhowtf/omniget", features = ["desktop"] }

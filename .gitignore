@@ -1,0 +1,4 @@
+node_modules/
+target/
+frontend/node_modules/
+frontend/build/
