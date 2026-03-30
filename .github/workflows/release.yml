@@ -59,7 +59,11 @@ jobs:
           if [ -d frontend/build ]; then cp -r frontend/build/* dist/frontend/; fi
           if [ -d i18n ]; then cp -r i18n/* dist/i18n/; fi
           if [ -d assets ]; then cp -r assets dist/assets; fi
-          cd dist && zip -r ../omniget-plugin-telegram-${{ github.ref_name }}-${{ matrix.artifact }}.zip .
+          if command -v zip &> /dev/null; then
+            cd dist && zip -r ../omniget-plugin-telegram-${{ github.ref_name }}-${{ matrix.artifact }}.zip .
+          else
+            cd dist && pwsh -Command "Compress-Archive -Path * -DestinationPath ../omniget-plugin-telegram-${{ github.ref_name }}-${{ matrix.artifact }}.zip"
+          fi
 
       - uses: softprops/action-gh-release@v2
         with:
