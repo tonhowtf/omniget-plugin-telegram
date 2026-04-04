@@ -13,14 +13,20 @@ use platforms::telegram::thumbnail_cache;
 
 pub struct TelegramPlugin {
     host: Option<Arc<dyn PluginHost>>,
+    runtime: Arc<tokio::runtime::Runtime>,
     telegram_session: TelegramSessionHandle,
     active_downloads: Arc<tokio::sync::Mutex<HashMap<u64, (String, CancellationToken)>>>,
 }
 
 impl TelegramPlugin {
     pub fn new() -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime for telegram plugin");
         Self {
             host: None,
+            runtime: Arc::new(runtime),
             telegram_session: Arc::new(tokio::sync::Mutex::new(TelegramState::new())),
             active_downloads: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
@@ -60,6 +66,18 @@ impl OmnigetPlugin for TelegramPlugin {
     fn version(&self) -> &str { env!("CARGO_PKG_VERSION") }
 
     fn initialize(&mut self, host: Arc<dyn PluginHost>) -> anyhow::Result<()> {
+        if let Some(proxy) = host.proxy_config() {
+            omniget_core::core::http_client::init_proxy(
+                omniget_core::models::settings::ProxySettings {
+                    enabled: true,
+                    proxy_type: proxy.proxy_type,
+                    host: proxy.host,
+                    port: proxy.port,
+                    username: proxy.username.unwrap_or_default(),
+                    password: proxy.password.unwrap_or_default(),
+                }
+            );
+        }
         self.host = Some(host);
         Ok(())
     }
@@ -74,8 +92,10 @@ impl OmnigetPlugin for TelegramPlugin {
         let active = self.active_downloads.clone();
         let fix_ext = self.fix_file_extensions();
         let concurrent = self.concurrent_downloads().clamp(1, 10);
+        let runtime_handle = self.runtime.handle().clone();
 
         Box::pin(async move {
+            runtime_handle.spawn(async move {
             match command.as_str() {
                 "telegram_check_session" => {
                     let r = auth::check_session(&session).await.map_err(|e| e.to_string())?;
@@ -305,6 +325,7 @@ impl OmnigetPlugin for TelegramPlugin {
 
                 _ => Err(format!("Unknown command: {}", command)),
             }
+            }).await.map_err(|e| format!("task join error: {}", e))?
         })
     }
 

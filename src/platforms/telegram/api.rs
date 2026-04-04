@@ -11,8 +11,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::auth::TelegramSessionHandle;
 
-/// Maps a MIME type to a file extension (with leading dot).
-/// Covers the most common Telegram media MIME types.
 fn mime_to_ext(mime: &str) -> &'static str {
     match mime {
         // Video
@@ -64,8 +62,6 @@ fn mime_to_ext(mime: &str) -> &'static str {
         // Fallback: try to extract from the subtype
         other => {
             if let Some(sub) = other.split('/').nth(1) {
-                // Common pattern: "video/mp4" → ".mp4"
-                // But we only return static strings, so we use a catch-all
                 match sub {
                     "mp4" => ".mp4",
                     "mpeg" => ".mpeg",
@@ -85,14 +81,10 @@ fn mime_to_ext(mime: &str) -> &'static str {
     }
 }
 
-/// Ensures a filename has a proper extension based on its MIME type.
-/// If the file already has a known extension, keeps it.
-/// If not, appends the MIME-derived extension.
 fn ensure_extension(name: &str, mime_type: &str) -> String {
     let path = Path::new(name);
     if let Some(ext) = path.extension() {
         let ext_str = ext.to_string_lossy().to_lowercase();
-        // Already has a recognized extension
         let known = matches!(
             ext_str.as_str(),
             "mp4" | "mkv" | "webm" | "mov" | "avi" | "mpeg" | "3gp" | "flv"
@@ -108,7 +100,6 @@ fn ensure_extension(name: &str, mime_type: &str) -> String {
         }
     }
 
-    // No extension or unknown extension — add from MIME type
     let ext = mime_to_ext(mime_type);
     if ext.is_empty() {
         name.to_string()
@@ -207,7 +198,6 @@ fn extract_raw_media_info(media: &tl::enums::MessageMedia, fix_extensions: bool)
                     None
                 }
             }).unwrap_or_else(|| {
-                // No filename attribute — use ID + MIME extension (like tdl-master)
                 let ext = mime_to_ext(&doc.mime_type);
                 if ext.is_empty() {
                     format!("file_{}", doc.id)
@@ -215,7 +205,6 @@ fn extract_raw_media_info(media: &tl::enums::MessageMedia, fix_extensions: bool)
                     format!("{}{}", doc.id, ext)
                 }
             });
-            // Ensure files with names but missing extensions get the right one
             let name = if fix_extensions {
                 ensure_extension(&raw_name, &doc.mime_type)
             } else {
@@ -261,8 +250,6 @@ pub async fn list_chats(
             };
             let title = peer.name().unwrap_or("Unknown").to_string();
 
-            // PeerRef::from / PeerId::bare_id() can panic on peers with IDs
-            // outside the expected ranges (e.g. monoforums, corrupted sessions).
             let peer_data = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 use grammers_client::session::defs::PeerRef;
                 let peer_ref = PeerRef::from(peer);
@@ -626,8 +613,6 @@ pub async fn download_media_with_retry(
                 let err_str = e.to_string();
 
                 if parse_flood_wait(&err_str).is_some() {
-                    // Flood wait is handled inside invoke_with_flood_wait,
-                    // but if it bubbles up, retry
                     tracing::warn!(
                         "[tg-api] flood wait error on attempt {}, retrying: {}",
                         attempt + 1, err_str
