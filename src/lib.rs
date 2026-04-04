@@ -235,8 +235,8 @@ impl OmnigetPlugin for TelegramPlugin {
                                 if cancel.is_cancelled() { return; }
                                 let output_path = std::path::PathBuf::from(&output_dir).join(&item.file_name);
 
-                                if let Ok(true) = tokio::fs::try_exists(&output_path).await {
-                                    if let Ok(meta) = tokio::fs::metadata(&output_path).await {
+                                if output_path.exists() {
+                                    if let Ok(meta) = std::fs::metadata(&output_path) {
                                         if meta.len() > 0 {
                                             skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             let done = completed.load(std::sync::atomic::Ordering::Relaxed) + failed.load(std::sync::atomic::Ordering::Relaxed) + skipped.load(std::sync::atomic::Ordering::Relaxed);

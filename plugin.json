@@ -1,7 +1,7 @@
 {
   "id": "telegram",
   "name": "Telegram Downloader",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "min_omniget_version": "0.4.0",
   "description": "Download photos, videos, files, and audio from Telegram channels and groups with QR code or phone login.",
   "author": "tonhowtf",

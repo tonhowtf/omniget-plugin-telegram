@@ -93,8 +93,8 @@ pub fn create_client() -> anyhow::Result<Client> {
 
 pub async fn delete_session() -> anyhow::Result<()> {
     let path = session_file_path()?;
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        tokio::fs::remove_file(&path).await?;
+    if path.exists() {
+        std::fs::remove_file(&path)?;
     }
     Ok(())
 }

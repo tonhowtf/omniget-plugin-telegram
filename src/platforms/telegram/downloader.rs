@@ -239,7 +239,7 @@ impl PlatformDownloader for TelegramDownloader {
             quality.format
         );
         let output_path = opts.output_dir.join(&filename);
-        tokio::fs::create_dir_all(&opts.output_dir).await?;
+        std::fs::create_dir_all(&opts.output_dir)?;
 
         let tmp_path = std::path::PathBuf::from(format!("{}.tmp", output_path.display()));
         const MAX_REF_RETRIES: u32 = 2;
@@ -264,7 +264,7 @@ impl PlatformDownloader for TelegramDownloader {
 
             match result {
                 Ok(size) => {
-                    tokio::fs::rename(&tmp_path, &output_path).await?;
+                    std::fs::rename(&tmp_path, &output_path)?;
                     let _ = progress.send(100.0).await;
                     tracing::info!(
                         "[tg-dl] download completed in {:?}, {} bytes",
@@ -278,7 +278,7 @@ impl PlatformDownloader for TelegramDownloader {
                     });
                 }
                 Err(e) => {
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    let _ = std::fs::remove_file(&tmp_path);
                     let err_str = e.to_string().to_lowercase();
                     if err_str.contains("file_reference") && ref_attempt < MAX_REF_RETRIES {
                         tracing::warn!(

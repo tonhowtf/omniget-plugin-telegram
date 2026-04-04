@@ -513,7 +513,7 @@ pub async fn download_media(
     }
 
     if let Some(parent) = output_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        std::fs::create_dir_all(parent)?;
     }
 
     let tmp_path = PathBuf::from(format!("{}.tmp", output_path.display()));
@@ -537,7 +537,7 @@ pub async fn download_media(
 
         match result {
             Ok(downloaded) => {
-                tokio::fs::rename(&tmp_path, output_path).await?;
+                std::fs::rename(&tmp_path, output_path)?;
                 let ts = msg_date as i64;
                 if ts > 0 {
                     let file_time = filetime::FileTime::from_unix_time(ts, 0);
@@ -549,7 +549,7 @@ pub async fn download_media(
                 return Ok(downloaded);
             }
             Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
+                let _ = std::fs::remove_file(&tmp_path);
                 let err_lower = e.to_string().to_lowercase();
                 if err_lower.contains("file_reference") && ref_attempt < MAX_REF_RETRIES {
                     tracing::warn!(

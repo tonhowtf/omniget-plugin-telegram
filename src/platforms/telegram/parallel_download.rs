@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 
 use grammers_client::Client;
 use grammers_client::grammers_tl_types as tl;
-use tokio::io::AsyncWriteExt;
+use std::io::Write;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -186,14 +186,14 @@ pub async fn download_file(
 
     ensure_auth_on_dc(client, dc).await?;
 
-    let mut file = tokio::fs::File::create(output_path).await?;
+    let mut file = std::fs::File::create(output_path)?;
     let mut downloaded: u64 = 0;
     let mut offset: i64 = 0;
 
     loop {
         if cancel_token.is_cancelled() {
             drop(file);
-            let _ = tokio::fs::remove_file(output_path).await;
+            let _ = std::fs::remove_file(output_path);
             return Err(anyhow::anyhow!("Download cancelled"));
         }
 
@@ -211,7 +211,7 @@ pub async fn download_file(
                     break;
                 }
 
-                file.write_all(&f.bytes).await?;
+                file.write_all(&f.bytes)?;
                 downloaded += f.bytes.len() as u64;
                 offset += MAX_CHUNK_SIZE as i64;
 
@@ -249,13 +249,13 @@ pub async fn download_file(
             }
             Err(e) => {
                 drop(file);
-                let _ = tokio::fs::remove_file(output_path).await;
+                let _ = std::fs::remove_file(output_path);
                 return Err(anyhow::anyhow!("upload.getFile failed: {}", e));
             }
         }
     }
 
-    file.flush().await?;
+    file.flush()?;
     tracing::info!("[tg-dl] download complete: {} bytes, dc={}", downloaded, dc);
     Ok(downloaded)
 }
