@@ -26,8 +26,22 @@ url = "2"
 filetime = "0.2.27"
 os_info = "3"
 sys-locale = "0.3"
+axum = "0.7"
+async-stream = "0.3"
+bytes = "1"
+futures = "0.3"
+rand = "0.8"
+sha2 = "0.10"
+dashmap = "5"
+aes = "0.8"
+ctr = "0.9"
+cipher = "0.4"
 omniget-core = { git = "https://github.com/tonhowtf/omniget", features = ["desktop"] }
 omniget-plugin-sdk = { git = "https://github.com/tonhowtf/omniget" }
 
 [patch.crates-io]
 grammers-session = { path = "grammers-session-patched" }
+
+[patch."https://github.com/tonhowtf/omniget"]
+omniget-plugin-sdk = { path = "../omniget/src-tauri/omniget-plugin-sdk" }
+omniget-core = { path = "../omniget/src-tauri/omniget-core" }

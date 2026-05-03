@@ -1,5 +1,12 @@
+pub mod accounts;
 pub mod api;
 pub mod auth;
+pub mod bandwidth;
+pub mod cdn;
+pub mod clone;
 pub mod downloader;
 pub mod parallel_download;
+pub mod resume;
+pub mod stream_server;
+pub mod sync_state;
 pub mod thumbnail_cache;

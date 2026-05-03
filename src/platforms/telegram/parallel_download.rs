@@ -1,11 +1,77 @@
+use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
+static MAX_THREADS_CAP: AtomicUsize = AtomicUsize::new(8);
+
+pub fn set_max_threads_cap(n: usize) {
+    let clamped = n.clamp(1, 32);
+    MAX_THREADS_CAP.store(clamped, Ordering::Relaxed);
+}
+
+pub fn get_max_threads_cap() -> usize {
+    MAX_THREADS_CAP.load(Ordering::Relaxed)
+}
+
+use bytes::Bytes;
+use futures::stream::Stream;
 use grammers_client::Client;
 use grammers_client::grammers_tl_types as tl;
 use std::io::Write;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
+
+pub struct StreamSpeedTracker {
+    samples: Mutex<VecDeque<(Instant, u64)>>,
+}
+
+impl StreamSpeedTracker {
+    pub fn new() -> Self {
+        Self {
+            samples: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    pub async fn record(&self, bytes: u64) {
+        let mut s = self.samples.lock().await;
+        let now = Instant::now();
+        s.push_back((now, bytes));
+        let cutoff = now - std::time::Duration::from_secs(5);
+        while let Some(&(t, _)) = s.front() {
+            if t < cutoff {
+                s.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub async fn current_rate_bytes_per_sec(&self) -> u64 {
+        let s = self.samples.lock().await;
+        if s.is_empty() {
+            return 0;
+        }
+        let total: u64 = s.iter().map(|(_, b)| *b).sum();
+        let elapsed = match (s.front(), s.back()) {
+            (Some((first, _)), Some((last, _))) => last.duration_since(*first).as_secs_f64().max(1.0),
+            _ => 1.0,
+        };
+        (total as f64 / elapsed) as u64
+    }
+}
+
+impl Default for StreamSpeedTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn global_stream_tracker() -> &'static Arc<StreamSpeedTracker> {
+    static INSTANCE: OnceLock<Arc<StreamSpeedTracker>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Arc::new(StreamSpeedTracker::new()))
+}
 
 pub struct MediaLocation {
     pub location: tl::enums::InputFileLocation,
@@ -126,12 +192,39 @@ pub async fn fetch_raw_media(
 const MAX_CHUNK_SIZE: i32 = 512 * 1024;
 const FILE_MIGRATE_ERROR: i32 = 303;
 
+pub fn compute_thread_count(file_size: u64) -> usize {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    let raw = if file_size < MB {
+        1
+    } else if file_size < 5 * MB {
+        2
+    } else if file_size < 20 * MB {
+        4
+    } else if file_size >= 50 * MB {
+        8
+    } else {
+        4
+    };
+    raw.min(get_max_threads_cap()).max(1)
+}
+
 fn auth_copied_dcs() -> &'static Arc<Mutex<Vec<i32>>> {
     static INSTANCE: OnceLock<Arc<Mutex<Vec<i32>>>> = OnceLock::new();
     INSTANCE.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
 }
 
-async fn ensure_auth_on_dc(client: &Client, target_dc_id: i32) -> anyhow::Result<()> {
+pub async fn ensure_auth_on_dc(client: &Client, target_dc_id: i32) -> anyhow::Result<()> {
+    if target_dc_id <= 0 {
+        return Ok(());
+    }
+
+    if let Some(home_dc) = super::auth::current_home_dc_id() {
+        if home_dc == target_dc_id {
+            return Ok(());
+        }
+    }
+
     {
         let copied = auth_copied_dcs().lock().await;
         if copied.contains(&target_dc_id) {
@@ -141,12 +234,35 @@ async fn ensure_auth_on_dc(client: &Client, target_dc_id: i32) -> anyhow::Result
 
     tracing::info!("[tg-dl] copying auth to DC {}", target_dc_id);
 
-    let tl::enums::auth::ExportedAuthorization::Authorization(exported) = client
+    let exported_res = client
         .invoke(&tl::functions::auth::ExportAuthorization {
             dc_id: target_dc_id,
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("ExportAuthorization to DC {}: {}", target_dc_id, e))?;
+        .await;
+
+    let exported = match exported_res {
+        Ok(tl::enums::auth::ExportedAuthorization::Authorization(e)) => e,
+        Err(grammers_mtsender::InvocationError::Rpc(ref err))
+            if err.name == "DC_ID_INVALID" =>
+        {
+            tracing::warn!(
+                "[tg-dl] DC_ID_INVALID for ExportAuthorization to DC {} — assuming home DC, skipping",
+                target_dc_id
+            );
+            let mut copied = auth_copied_dcs().lock().await;
+            if !copied.contains(&target_dc_id) {
+                copied.push(target_dc_id);
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "ExportAuthorization to DC {}: {}",
+                target_dc_id,
+                e
+            ));
+        }
+    };
 
     let _: tl::enums::auth::Authorization = client
         .invoke_in_dc(
@@ -177,13 +293,25 @@ pub async fn download_file(
     progress_tx: mpsc::Sender<f64>,
     cancel_token: &CancellationToken,
 ) -> anyhow::Result<u64> {
+    let threads = compute_thread_count(media.size);
     tracing::info!(
-        "[tg-dl] starting download: size={}, dc={}, path={}",
-        media.size, media.dc_id, output_path.display()
+        "[tg-dl] starting download: size={}, dc={}, threads={}, path={}",
+        media.size, media.dc_id, threads, output_path.display()
     );
+    if threads <= 1 || media.size == 0 {
+        return download_file_sequential(client, media, output_path, progress_tx, cancel_token).await;
+    }
+    download_file_parallel(client, media, output_path, threads, progress_tx, cancel_token).await
+}
 
+async fn download_file_sequential(
+    client: &Client,
+    media: &MediaLocation,
+    output_path: &Path,
+    progress_tx: mpsc::Sender<f64>,
+    cancel_token: &CancellationToken,
+) -> anyhow::Result<u64> {
     let mut dc = media.dc_id;
-
     ensure_auth_on_dc(client, dc).await?;
 
     let mut file = std::fs::File::create(output_path)?;
@@ -256,6 +384,279 @@ pub async fn download_file(
     }
 
     file.flush()?;
-    tracing::info!("[tg-dl] download complete: {} bytes, dc={}", downloaded, dc);
+    tracing::info!("[tg-dl] download complete: {} bytes, dc={}", downloaded, media.dc_id);
     Ok(downloaded)
+}
+
+async fn download_file_parallel(
+    client: &Client,
+    media: &MediaLocation,
+    output_path: &Path,
+    threads: usize,
+    progress_tx: mpsc::Sender<f64>,
+    cancel_token: &CancellationToken,
+) -> anyhow::Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let dc = media.dc_id;
+    ensure_auth_on_dc(client, dc).await?;
+
+    let total = media.size;
+    let chunk: i32 = MAX_CHUNK_SIZE;
+    let chunk_u = chunk as u64;
+    let aligned = total.div_ceil(chunk_u) * chunk_u;
+    let per_worker = aligned.div_ceil(threads as u64);
+    let per_worker = ((per_worker / chunk_u).max(1)) * chunk_u;
+
+    let prealloc = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(output_path)?;
+    prealloc.set_len(total)?;
+    drop(prealloc);
+
+    let downloaded = Arc::new(AtomicU64::new(0));
+    let file_mu = Arc::new(Mutex::new(std::fs::OpenOptions::new().write(true).open(output_path)?));
+
+    let mut handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+    for w in 0..threads {
+        let start = (w as u64) * per_worker;
+        if start >= total {
+            break;
+        }
+        let end = (start + per_worker).min(total);
+        let client = client.clone();
+        let location = media.location.clone();
+        let cancel = cancel_token.clone();
+        let downloaded = downloaded.clone();
+        let progress_tx = progress_tx.clone();
+        let file_mu = file_mu.clone();
+
+        handles.push(tokio::spawn(async move {
+            let mut offset = start as i64;
+            while (offset as u64) < end {
+                if cancel.is_cancelled() {
+                    return Err(anyhow::anyhow!("Download cancelled"));
+                }
+                let request = tl::functions::upload::GetFile {
+                    precise: true,
+                    cdn_supported: false,
+                    location: location.clone(),
+                    offset,
+                    limit: chunk,
+                };
+                match client.invoke_in_dc(dc, &request).await {
+                    Ok(tl::enums::upload::File::File(f)) => {
+                        if f.bytes.is_empty() {
+                            return Ok(());
+                        }
+                        let bytes_len = f.bytes.len() as u64;
+                        {
+                            let mut g = file_mu.lock().await;
+                            g.seek(SeekFrom::Start(offset as u64))?;
+                            g.write_all(&f.bytes)?;
+                        }
+                        let new_total = downloaded.fetch_add(bytes_len, Ordering::Relaxed) + bytes_len;
+                        if total > 0 {
+                            let percent = (new_total as f64 / total as f64) * 100.0;
+                            let _ = progress_tx.send(percent.min(100.0)).await;
+                        }
+                        offset += chunk as i64;
+                        if (f.bytes.len() as i32) < chunk {
+                            return Ok(());
+                        }
+                    }
+                    Ok(tl::enums::upload::File::CdnRedirect(_)) => {
+                        return Err(anyhow::anyhow!("CDN redirect not supported"));
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("upload.getFile failed (worker {} offset {}): {}", w, offset, e));
+                    }
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    let mut first_err: Option<anyhow::Error> = None;
+    for h in handles {
+        match h.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                cancel_token.cancel();
+            }
+            Err(je) => {
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("worker join error: {}", je));
+                }
+                cancel_token.cancel();
+            }
+        }
+    }
+
+    if let Some(e) = first_err {
+        let _ = std::fs::remove_file(output_path);
+        return Err(e);
+    }
+
+    let final_total = downloaded.load(std::sync::atomic::Ordering::Relaxed);
+    tracing::info!("[tg-dl] parallel download complete: {} bytes, dc={}, threads={}", final_total, dc, threads);
+    Ok(final_total)
+}
+
+pub fn stream_file_range(
+    client: Client,
+    media: MediaLocation,
+    range_start: u64,
+    range_end: u64,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
+    async_stream::stream! {
+        let total_to_emit = range_end.saturating_sub(range_start).saturating_add(1);
+        if total_to_emit == 0 {
+            return;
+        }
+
+        let chunk_size: i64 = MAX_CHUNK_SIZE as i64;
+        let aligned_start = (range_start / chunk_size as u64) * chunk_size as u64;
+        let mut prefix_skip = (range_start - aligned_start) as usize;
+
+        let mut offset = aligned_start as i64;
+        let mut emitted: u64 = 0;
+        let mut dc = media.dc_id;
+
+        if let Err(e) = ensure_auth_on_dc(&client, dc).await {
+            yield Err(std::io::Error::other(format!("auth: {}", e)));
+            return;
+        }
+
+        loop {
+            if emitted >= total_to_emit {
+                break;
+            }
+            let request = tl::functions::upload::GetFile {
+                precise: true,
+                cdn_supported: false,
+                location: media.location.clone(),
+                offset,
+                limit: MAX_CHUNK_SIZE,
+            };
+            match client.invoke_in_dc(dc, &request).await {
+                Ok(tl::enums::upload::File::File(f)) => {
+                    if f.bytes.is_empty() {
+                        break;
+                    }
+                    let mut bytes_slice: &[u8] = &f.bytes;
+                    if prefix_skip > 0 {
+                        if prefix_skip >= bytes_slice.len() {
+                            prefix_skip -= bytes_slice.len();
+                            offset += chunk_size;
+                            continue;
+                        }
+                        bytes_slice = &bytes_slice[prefix_skip..];
+                        prefix_skip = 0;
+                    }
+                    let remaining = total_to_emit - emitted;
+                    let take = (bytes_slice.len() as u64).min(remaining) as usize;
+                    let to_yield = Bytes::copy_from_slice(&bytes_slice[..take]);
+                    emitted += take as u64;
+                    global_stream_tracker().record(take as u64).await;
+                    yield Ok(to_yield);
+                    if (f.bytes.len() as i32) < MAX_CHUNK_SIZE {
+                        break;
+                    }
+                    offset += chunk_size;
+                }
+                Ok(tl::enums::upload::File::CdnRedirect(_)) => {
+                    yield Err(std::io::Error::other("CDN redirect not supported"));
+                    return;
+                }
+                Err(grammers_mtsender::InvocationError::Rpc(ref err))
+                    if err.name == "AUTH_KEY_UNREGISTERED" =>
+                {
+                    {
+                        let mut copied = auth_copied_dcs().lock().await;
+                        copied.retain(|&d| d != dc);
+                    }
+                    if let Err(e) = ensure_auth_on_dc(&client, dc).await {
+                        yield Err(std::io::Error::other(format!("auth re-copy: {}", e)));
+                        return;
+                    }
+                    continue;
+                }
+                Err(grammers_mtsender::InvocationError::Rpc(ref err))
+                    if err.code == FILE_MIGRATE_ERROR =>
+                {
+                    let new_dc = err.value.map(|v| v as i32).unwrap_or(dc);
+                    dc = new_dc;
+                    if let Err(e) = ensure_auth_on_dc(&client, dc).await {
+                        yield Err(std::io::Error::other(format!("auth migrate: {}", e)));
+                        return;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    yield Err(std::io::Error::other(format!("upload.getFile: {}", e)));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+pub fn mime_type_from_media(media: &tl::enums::MessageMedia) -> String {
+    match media {
+        tl::enums::MessageMedia::Document(d) => match d.document.as_ref() {
+            Some(tl::enums::Document::Document(doc)) => doc.mime_type.clone(),
+            _ => "application/octet-stream".to_string(),
+        },
+        tl::enums::MessageMedia::Photo(_) => "image/jpeg".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod compute_thread_count_tests {
+    use super::compute_thread_count;
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+
+    #[test]
+    fn small_file_under_1mb_uses_1_thread() {
+        assert_eq!(compute_thread_count(0), 1);
+        assert_eq!(compute_thread_count(500 * KB), 1);
+        assert_eq!(compute_thread_count(MB - 1), 1);
+    }
+
+    #[test]
+    fn between_1mb_and_5mb_uses_2_threads() {
+        assert_eq!(compute_thread_count(MB), 2);
+        assert_eq!(compute_thread_count(2 * MB), 2);
+        assert_eq!(compute_thread_count(5 * MB - 1), 2);
+    }
+
+    #[test]
+    fn between_5mb_and_20mb_uses_4_threads() {
+        assert_eq!(compute_thread_count(5 * MB), 4);
+        assert_eq!(compute_thread_count(10 * MB), 4);
+        assert_eq!(compute_thread_count(20 * MB - 1), 4);
+    }
+
+    #[test]
+    fn between_20mb_and_50mb_uses_4_fallback() {
+        assert_eq!(compute_thread_count(20 * MB), 4);
+        assert_eq!(compute_thread_count(30 * MB), 4);
+        assert_eq!(compute_thread_count(50 * MB - 1), 4);
+    }
+
+    #[test]
+    fn at_50mb_or_above_uses_8_threads() {
+        assert_eq!(compute_thread_count(50 * MB), 8);
+        assert_eq!(compute_thread_count(100 * MB), 8);
+        assert_eq!(compute_thread_count(1000 * MB), 8);
+    }
 }

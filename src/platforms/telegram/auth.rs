@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use dashmap::DashMap;
 use grammers_client::{Client, SignInError};
 use grammers_client::grammers_tl_types as tl;
 use grammers_client::types::{LoginToken, PasswordToken};
@@ -14,6 +16,69 @@ use grammers_session::updates::UpdatesLike;
 use qrcode::QrCode;
 use qrcode::render::svg;
 use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
+
+pub type OpTokenMap = Arc<DashMap<String, CancellationToken>>;
+
+pub fn register_op_token(map: &OpTokenMap, op_id: &str) -> CancellationToken {
+    let token = CancellationToken::new();
+    map.insert(op_id.to_string(), token.clone());
+    token
+}
+
+pub fn unregister_op_token(map: &OpTokenMap, op_id: &str) {
+    map.remove(op_id);
+}
+
+pub fn cancel_op_token(map: &OpTokenMap, op_id: &str) -> bool {
+    if let Some((_, token)) = map.remove(op_id) {
+        token.cancel();
+        true
+    } else {
+        false
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedMediaMeta {
+    pub filename: String,
+    pub mime: String,
+    pub size: u64,
+    pub fetched_at: Instant,
+}
+
+const META_TTL: Duration = Duration::from_secs(5 * 60);
+const META_MAX_ENTRIES: usize = 5000;
+
+pub type MetadataCache = Arc<DashMap<(i64, i32), CachedMediaMeta>>;
+
+pub fn metadata_get(cache: &MetadataCache, chat_id: i64, message_id: i32) -> Option<CachedMediaMeta> {
+    let entry = cache.get(&(chat_id, message_id))?;
+    if entry.fetched_at.elapsed() > META_TTL {
+        drop(entry);
+        cache.remove(&(chat_id, message_id));
+        return None;
+    }
+    Some(entry.clone())
+}
+
+pub fn metadata_put(cache: &MetadataCache, chat_id: i64, message_id: i32, meta: CachedMediaMeta) {
+    if cache.len() >= META_MAX_ENTRIES {
+        let mut oldest_key: Option<(i64, i32)> = None;
+        let mut oldest_at: Option<Instant> = None;
+        for r in cache.iter() {
+            let at = r.value().fetched_at;
+            if oldest_at.map(|o| at < o).unwrap_or(true) {
+                oldest_at = Some(at);
+                oldest_key = Some(*r.key());
+            }
+        }
+        if let Some(k) = oldest_key {
+            cache.remove(&k);
+        }
+    }
+    cache.insert((chat_id, message_id), meta);
+}
 
 const API_ID: i32 = 15055931;
 const API_HASH: &str = "021d433426cbb920eeb95164498fe3d3";
@@ -27,6 +92,10 @@ pub struct TelegramState {
     pub password_token: Option<PasswordToken>,
     pub updates_rx: Option<mpsc::UnboundedReceiver<UpdatesLike>>,
     pub peer_hashes: HashMap<i64, i64>,
+    pub peer_photo_ids: HashMap<i64, i64>,
+    pub metadata_cache: MetadataCache,
+    pub takeout_session_id: Option<i64>,
+    pub op_cancellation_tokens: OpTokenMap,
 }
 
 impl Default for TelegramState {
@@ -44,6 +113,10 @@ impl TelegramState {
             password_token: None,
             updates_rx: None,
             peer_hashes: HashMap::new(),
+            peer_photo_ids: HashMap::new(),
+            metadata_cache: Arc::new(DashMap::new()),
+            takeout_session_id: None,
+            op_cancellation_tokens: Arc::new(DashMap::new()),
         }
     }
 }
@@ -61,6 +134,12 @@ fn open_session() -> anyhow::Result<Arc<SqliteSession>> {
     }
     let session = SqliteSession::open(path)?;
     Ok(Arc::new(session))
+}
+
+pub fn current_home_dc_id() -> Option<i32> {
+    let session = open_session().ok()?;
+    let dc = session.home_dc_id();
+    if dc <= 0 { None } else { Some(dc) }
 }
 
 fn connection_params() -> ConnectionParams {

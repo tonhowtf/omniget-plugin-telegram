@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use grammers_client::Client;
@@ -8,9 +9,27 @@ use tokio::sync::Mutex;
 
 use super::auth::TelegramSessionHandle;
 use super::parallel_download::fetch_raw_media;
+use crate::preview_cache::{PreviewDiskCache, DEFAULT_MAX_BYTES, DEFAULT_MAX_FILES};
 
 const TTL_SECS: u64 = 120;
 const MAX_BYTES: u64 = 30 * 1024 * 1024;
+const DISK_CACHE_THRESHOLD_BYTES: usize = 200 * 1024;
+
+static DISK_CACHE: OnceLock<Arc<PreviewDiskCache>> = OnceLock::new();
+
+pub fn init_disk_cache(dir: PathBuf) {
+    let cache = Arc::new(PreviewDiskCache::new(dir, DEFAULT_MAX_FILES, DEFAULT_MAX_BYTES));
+    let _ = DISK_CACHE.set(cache);
+    tracing::info!("[preview-cache] initialized");
+}
+
+fn disk_cache() -> Option<Arc<PreviewDiskCache>> {
+    DISK_CACHE.get().cloned()
+}
+
+fn disk_key(chat_id: i64, message_id: i32) -> String {
+    format!("thumb_{}_{}", chat_id, message_id)
+}
 
 struct CacheEntry {
     data: Vec<u8>,
@@ -187,11 +206,15 @@ async fn download_to_memory(
     location: tl::enums::InputFileLocation,
     total_size: u64,
 ) -> anyhow::Result<Vec<u8>> {
+    use std::time::Duration;
     const PART_SIZE: i32 = 512 * 1024;
+    const CHUNK_TIMEOUT_SECS: u64 = 15;
+    const MAX_CHUNKS: usize = 256;
+    const MAX_CHUNK_RETRIES: u32 = 3;
     let mut data = Vec::with_capacity(total_size as usize);
     let mut offset: i64 = 0;
 
-    loop {
+    for _ in 0..MAX_CHUNKS {
         let request = tl::functions::upload::GetFile {
             precise: true,
             cdn_supported: false,
@@ -200,15 +223,62 @@ async fn download_to_memory(
             limit: PART_SIZE,
         };
 
-        let response = client
-            .invoke(&request)
-            .await
-            .map_err(|e| anyhow::anyhow!("upload.GetFile thumbnail: {}", e))?;
+        let mut last_err: Option<String> = None;
+        let mut maybe_response: Option<tl::enums::upload::File> = None;
+        for attempt in 0..MAX_CHUNK_RETRIES {
+            let invoke_fut = client.invoke(&request);
+            match tokio::time::timeout(Duration::from_secs(CHUNK_TIMEOUT_SECS), invoke_fut).await {
+                Ok(Ok(r)) => { maybe_response = Some(r); break; }
+                Ok(Err(e)) => {
+                    let msg = e.to_string();
+                    if super::api::is_retryable_error(&msg) && attempt < MAX_CHUNK_RETRIES - 1 {
+                        let backoff = (100u64 as f64 * 1.1f64.powi(attempt as i32)) as u64;
+                        let backoff = backoff.min(5000);
+                        tracing::warn!(
+                            "[tg-api] retryable error '{}' attempt={} backoff={}ms (download_to_memory)",
+                            msg.chars().take(120).collect::<String>(),
+                            attempt + 1,
+                            backoff
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff)).await;
+                        last_err = Some(msg);
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!("upload.GetFile thumbnail: {}", msg));
+                }
+                Err(_) => {
+                    last_err = Some(format!("timeout after {}s", CHUNK_TIMEOUT_SECS));
+                    if attempt < MAX_CHUNK_RETRIES - 1 {
+                        tracing::warn!(
+                            "[tg-api] chunk timeout {}s attempt={} (download_to_memory)",
+                            CHUNK_TIMEOUT_SECS,
+                            attempt + 1
+                        );
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!("upload.GetFile timed out after {}s", CHUNK_TIMEOUT_SECS));
+                }
+            }
+        }
+        let response = match maybe_response {
+            Some(r) => r,
+            None => return Err(anyhow::anyhow!("upload.GetFile failed after retries: {}", last_err.unwrap_or_default())),
+        };
 
         let bytes = match response {
             tl::enums::upload::File::File(f) => f.bytes,
-            tl::enums::upload::File::CdnRedirect(_) => {
-                return Err(anyhow::anyhow!("CDN redirect not supported"));
+            tl::enums::upload::File::CdnRedirect(redirect) => {
+                tracing::info!(
+                    "[tg-cdn] redirect dc={}, downloading via CDN",
+                    redirect.dc_id
+                );
+                let cdn_data = super::cdn::download_via_cdn(client, &redirect, total_size).await?;
+                if cdn_data.len() > data.len() {
+                    data.extend_from_slice(&cdn_data[data.len()..]);
+                } else if cdn_data.len() > 0 && data.is_empty() {
+                    data.extend_from_slice(&cdn_data);
+                }
+                return Ok(data);
             }
         };
 
@@ -221,7 +291,7 @@ async fn download_to_memory(
         offset += len as i64;
 
         if (len as i32) < PART_SIZE {
-            break;
+            return Ok(data);
         }
     }
 
@@ -243,19 +313,47 @@ pub async fn get_thumbnail(
         }
     }
 
+    if let Some(disk) = disk_cache() {
+        let dk = disk_key(chat_id, message_id);
+        if let Some(bytes) = disk.get(&dk).await {
+            tracing::debug!("[preview-cache] hit chat={}/{} ({}B)", chat_id, message_id, bytes.len());
+            let mut c = cache().lock().await;
+            c.insert(key, bytes.clone());
+            return Ok(bytes);
+        }
+    }
+
     let guard = handle.lock().await;
     let client = guard
         .client
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Not authenticated"))?
         .clone();
-    let access_hash = guard.peer_hashes.get(&chat_id).copied().unwrap_or(0);
+    let mut access_hash = guard.peer_hashes.get(&chat_id).copied().unwrap_or(0);
     drop(guard);
 
-    let is_channel = chat_type == "channel" || (chat_type == "group" && access_hash != 0);
+    let mut is_channel = chat_type == "channel" || (chat_type == "group" && access_hash != 0);
 
-    let (raw_media, _date) =
-        fetch_raw_media(&client, chat_id, access_hash, is_channel, message_id).await?;
+    let raw_media = match fetch_raw_media(&client, chat_id, access_hash, is_channel, message_id).await {
+        Ok((media, _date)) => media,
+        Err(e) if chat_type == "channel" && super::api::is_channel_invalid_error(&e.to_string()) => {
+            tracing::warn!(
+                "[tg-thumb] CHANNEL_INVALID for chat={}/{} (hash={}), refreshing hash and retrying",
+                chat_id, message_id, access_hash
+            );
+            match super::api::refresh_channel_hash(handle, chat_id).await {
+                Ok(Some(new_hash)) if new_hash != access_hash => {
+                    access_hash = new_hash;
+                    is_channel = true;
+                    let (media, _date) =
+                        fetch_raw_media(&client, chat_id, access_hash, is_channel, message_id).await?;
+                    media
+                }
+                _ => return Err(e),
+            }
+        }
+        Err(e) => return Err(e),
+    };
 
     let (location, total_size) = extract_thumbnail_location(&raw_media)
         .ok_or_else(|| anyhow::anyhow!("No thumbnail available"))?;
@@ -265,6 +363,18 @@ pub async fn get_thumbnail(
     {
         let mut c = cache().lock().await;
         c.insert(key, data.clone());
+    }
+
+    if data.len() > DISK_CACHE_THRESHOLD_BYTES {
+        if let Some(disk) = disk_cache() {
+            let dk = disk_key(chat_id, message_id);
+            let bytes = data.clone();
+            tokio::spawn(async move {
+                if let Err(e) = disk.put(&dk, &bytes).await {
+                    tracing::warn!("[preview-cache] put failed: {}", e);
+                }
+            });
+        }
     }
 
     Ok(data)
@@ -376,10 +486,14 @@ pub async fn get_chat_photo(
         .ok_or_else(|| anyhow::anyhow!("Not authenticated"))?
         .clone();
     let access_hash = guard.peer_hashes.get(&chat_id).copied().unwrap_or(0);
+    let cached_photo_id = guard.peer_photo_ids.get(&chat_id).copied();
     drop(guard);
 
     let input_peer = super::api::make_input_peer(chat_id, chat_type, access_hash);
-    let photo_id = fetch_chat_photo_id(&client, chat_id, chat_type, access_hash).await?;
+    let photo_id = match cached_photo_id {
+        Some(p) => p,
+        None => fetch_chat_photo_id(&client, chat_id, chat_type, access_hash).await?,
+    };
 
     let location = tl::enums::InputFileLocation::InputPeerPhotoFileLocation(
         tl::types::InputPeerPhotoFileLocation {
