@@ -1620,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "omniget-plugin-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1630,7 +1630,7 @@ dependencies = [
 
 [[package]]
 name = "omniget-plugin-telegram"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aes",
  "anyhow",
