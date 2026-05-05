@@ -25,8 +25,22 @@ jobs:
     permissions:
       contents: write
 
+    defaults:
+      run:
+        working-directory: omniget-plugin-telegram
+
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout plugin source
+        uses: actions/checkout@v6
+        with:
+          path: omniget-plugin-telegram
+
+      - name: Checkout host (for omniget-plugin-sdk path patch)
+        uses: actions/checkout@v6
+        with:
+          repository: tonhowtf/omniget
+          path: omniget
+          token: ${{ secrets.HOST_REPO_TOKEN || github.token }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -34,6 +48,7 @@ jobs:
 
       - name: Install Linux deps
         if: runner.os == 'Linux'
+        working-directory: .
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libssl-dev libayatana-appindicator3-dev librsvg2-dev
@@ -67,4 +82,4 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: omniget-plugin-telegram-*.zip
+          files: omniget-plugin-telegram/omniget-plugin-telegram-*.zip
