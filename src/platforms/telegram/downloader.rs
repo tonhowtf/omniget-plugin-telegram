@@ -171,8 +171,20 @@ impl PlatformDownloader for TelegramDownloader {
         &self,
         info: &MediaInfo,
         opts: &DownloadOptions,
-        progress: mpsc::Sender<f64>,
+        progress: mpsc::Sender<omniget_core::models::progress::ProgressUpdate>,
     ) -> anyhow::Result<DownloadResult> {
+        // internals report plain percent values; adapt them to the trait's
+        // ProgressUpdate channel
+        let (percent_tx, mut percent_rx) = mpsc::channel::<f64>(32);
+        let forward = progress.clone();
+        tokio::spawn(async move {
+            while let Some(pct) = percent_rx.recv().await {
+                let _ = forward
+                    .send(omniget_core::models::progress::ProgressUpdate::percent(pct))
+                    .await;
+            }
+        });
+        let progress = percent_tx;
         let _t = std::time::Instant::now();
         let quality = info
             .available_qualities

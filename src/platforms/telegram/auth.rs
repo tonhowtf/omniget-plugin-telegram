@@ -209,6 +209,13 @@ pub async fn check_session(handle: &TelegramSessionHandle) -> anyhow::Result<Str
         .map_err(|_| anyhow!("Session check timed out — please try again"))?
 }
 
+/// Timeout for QR-login network calls. grammers dials the Telegram DCs over
+/// raw TCP and does not go through the app proxy, so for users whose direct
+/// connection to Telegram is blocked these calls would otherwise hang forever.
+const QR_NETWORK_TIMEOUT: Duration = Duration::from_secs(20);
+
+const QR_NETWORK_TIMEOUT_MSG: &str = "Cannot reach Telegram. Note: the Telegram connection does not go through the app proxy yet — it needs direct network access (or a system-level VPN/TUN proxy).";
+
 pub struct QrLoginResult {
     pub qr_svg: String,
     pub expires: i32,
@@ -335,6 +342,15 @@ async fn handle_migrate(
 }
 
 pub async fn qr_login_start(handle: &TelegramSessionHandle) -> anyhow::Result<QrLoginResult> {
+    // Mirror check_session: bound the network-bound work so the invoke always
+    // resolves even when Telegram is unreachable (e.g. behind a proxy).
+    let start = qr_login_start_inner(handle);
+    tokio::time::timeout(QR_NETWORK_TIMEOUT, start)
+        .await
+        .map_err(|_| anyhow!(QR_NETWORK_TIMEOUT_MSG))?
+}
+
+async fn qr_login_start_inner(handle: &TelegramSessionHandle) -> anyhow::Result<QrLoginResult> {
     tracing::info!("[tg-qr] qr_login_start: creating client");
     let existing_client = {
         let guard = handle.lock().await;
@@ -417,6 +433,18 @@ pub async fn qr_login_poll(handle: &TelegramSessionHandle) -> anyhow::Result<QrP
 
     tracing::info!("[tg-qr] updateLoginToken received, calling ExportLoginToken to finalize");
 
+    // Mirror check_session: bound the network-bound finalization so the
+    // invoke always resolves even when Telegram is unreachable.
+    let finalize = qr_login_poll_finalize(handle, &client);
+    tokio::time::timeout(QR_NETWORK_TIMEOUT, finalize)
+        .await
+        .map_err(|_| anyhow!(QR_NETWORK_TIMEOUT_MSG))?
+}
+
+async fn qr_login_poll_finalize(
+    handle: &TelegramSessionHandle,
+    client: &Client,
+) -> anyhow::Result<QrPollStatus> {
     match export_login_token(&client).await {
         Ok(tl::enums::auth::LoginToken::Success(success)) => {
             let phone = extract_phone_from_auth(&success.authorization);
