@@ -1,0 +1,12 @@
+# Plugins are dynamic libraries that exchange Rust trait objects with the
+# host. Rust guarantees no ABI stability across compiler releases, so a host
+# and a plugin built with different rustc versions corrupt vtables and
+# segfault at the first plugin call. The host loader refuses to load plugins
+# whose embedded rustc fingerprint differs from its own, and this file pins
+# the compiler so host and plugin builds agree by construction.
+#
+# Must match rust-toolchain.toml in tonhowtf/omniget (the host) and the other
+# plugin repos. Bump it only in lockstep with a host release.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
