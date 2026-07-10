@@ -25,8 +25,24 @@ jobs:
     permissions:
       contents: write
 
+    defaults:
+      run:
+        working-directory: omniget-plugin-telegram
+
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout plugin source
+        uses: actions/checkout@v6
+        with:
+          path: omniget-plugin-telegram
+
+      # Cargo.toml patches omniget-plugin-sdk to ../omniget, so the host
+      # repo must sit next to this checkout for the build to resolve it.
+      - name: Checkout host (for omniget-plugin-sdk path patch)
+        uses: actions/checkout@v6
+        with:
+          repository: tonhowtf/omniget
+          path: omniget
+          token: ${{ secrets.HOST_REPO_TOKEN || github.token }}
 
       # Pinned via rust-toolchain.toml: the plugin ABI depends on the exact
       # rustc version, so this must match what the host (tonhowtf/omniget)
@@ -72,4 +88,4 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: omniget-plugin-telegram-*.zip
+          files: omniget-plugin-telegram/omniget-plugin-telegram-*.zip
